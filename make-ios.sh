@@ -30,7 +30,7 @@ TOOLCHAIN=1.98.1
 export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
 export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$HOME=/home --remap-path-prefix=$PWD=/muguet"
 
-if [ -n "$ZIP" ]; then
+if [ -n "$ZIP" ] && [ "${MUGUET_ON_DEVICE_COMPILE:-0}" != 1 ]; then
   cargo build --release
   mkdir -p target/ios-game
   case "$ZIP" in
@@ -48,7 +48,12 @@ else
   unset MUGUET_GAME_CODE || true
 fi
 
-IPHONEOS_DEPLOYMENT_TARGET=15.0 cargo "+$TOOLCHAIN" build --release --no-default-features --target aarch64-apple-ios --target-dir target/ios
+if [ "${MUGUET_ON_DEVICE_COMPILE:-0}" = 1 ]; then
+  echo "Building iOS runtime with on-device Cranelift compilation enabled."
+  IPHONEOS_DEPLOYMENT_TARGET=15.0 cargo "+$TOOLCHAIN" build --release --features jit --target aarch64-apple-ios --target-dir target/ios
+else
+  IPHONEOS_DEPLOYMENT_TARGET=15.0 cargo "+$TOOLCHAIN" build --release --no-default-features --target aarch64-apple-ios --target-dir target/ios
+fi
 
 (cd ios && xcodegen generate --quiet)
 rm -rf target/ios-xcode/Build/Products

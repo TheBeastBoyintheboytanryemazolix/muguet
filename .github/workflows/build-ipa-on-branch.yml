@@ -1,0 +1,75 @@
+name: Build Muguet IPA (on-device game compilation)
+
+on:
+  push:
+    branches:
+      - github-actions-build-ipa
+  workflow_dispatch:
+    inputs:
+      game_zip_url:
+        description: "Direct ZIP URL, Storage.to share URL, or public GoFile folder URL"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: muguet-ipa-branch-build
+  cancel-in-progress: true
+
+jobs:
+  build-ipa:
+    name: Build unsigned iOS IPA with on-device compiler
+    # Download only b/<build>/game.wasm using HTTP byte ranges; never store the 15+ GB ZIP.
+    runs-on: macos-26
+    timeout-minutes: 240
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Show Apple toolchain and disk space
+        run: |
+          xcodebuild -version
+          xcode-select -p
+          swift --version
+          df -h "$RUNNER_TEMP"
+
+      - name: Install xcodegen
+        run: |
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+          xcodegen --version
+
+      - name: Install required Rust toolchain and iOS target
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup target add aarch64-apple-ios --toolchain 1.98.1
+          rustup default 1.98.1
+          rustup toolchain list
+
+      - name: Build generic IPA with on-device compilation
+        env:
+          BUNDLE_ID: ch.cclerc.muguet.ios
+          MUGUET_ON_DEVICE_COMPILE: "1"
+        run: |
+          set -euo pipefail
+          ./make-ios.sh --ipa
+
+      - name: Verify IPA
+        run: |
+          set -euo pipefail
+          test -s build/Muguet.ipa
+          unzip -tq build/Muguet.ipa
+          unzip -Z1 build/Muguet.ipa | grep -q '^Payload/Muguet.app/'
+          echo "IPA built successfully. This is an ad-hoc/unsigned sideload build, not App Store signed." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: muguet-ios-ipa
+          path: build/Muguet.ipa
+          if-no-files-found: error
+          retention-days: 7

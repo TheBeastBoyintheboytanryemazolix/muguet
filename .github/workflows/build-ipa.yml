@@ -1,0 +1,219 @@
+name: Build iOS IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      include_game_code:
+        description: "Precompile your privately hosted game.wasm ZIP into the IPA (requires repository secrets)"
+        required: true
+        type: boolean
+        default: false
+      bundle_id:
+        description: "Bundle identifier for sideloading (use a unique reverse-DNS identifier)"
+        required: true
+        type: string
+        default: "ch.cclerc.muguet.ios"
+  push:
+    branches:
+      - main
+    paths:
+      - "src/**"
+      - "ios/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "build.rs"
+      - "make-ios.sh"
+      - ".github/workflows/build-ipa.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-ipa:
+    name: Build unsigned iOS IPA
+    runs-on: macos-26
+    timeout-minutes: 180
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Show Apple toolchain
+        run: |
+          xcodebuild -version
+          xcode-select -p
+          swift --version
+
+      - name: Install xcodegen
+        run: |
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+          xcodegen --version
+
+      - name: Install required Rust toolchain and iOS target
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup target add aarch64-apple-ios --toolchain 1.98.1
+          # make-ios.sh's first host build uses plain "cargo", so pin the default too.
+          rustup default 1.98.1
+          rustup toolchain list
+
+      - name: Cache Cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Download private game ZIP (supports GoFile folder links)
+        if: ${{ inputs.include_game_code }}
+        env:
+          GAME_ZIP_URL: ${{ secrets.MUGUET_GAME_ZIP_URL }}
+          GAME_ZIP_TOKEN: ${{ secrets.MUGUET_GAME_ZIP_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${GAME_ZIP_URL:-}" ]]; then
+            echo "::error::include_game_code was selected, but MUGUET_GAME_ZIP_URL is empty."
+            echo "Add the GoFile folder URL or a direct ZIP URL in Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+          case "$GAME_ZIP_URL" in
+            https://*) ;;
+            *) echo "::error::MUGUET_GAME_ZIP_URL must use HTTPS."; exit 1 ;;
+          esac
+
+          export GAME_ZIP_URL GAME_ZIP_TOKEN
+          python3 <<'PY'
+          import json, os, re, sys, urllib.error, urllib.parse, urllib.request
+
+          source = os.environ["GAME_ZIP_URL"].strip()
+          token = os.environ.get("GAME_ZIP_TOKEN", "").strip()
+          output = os.path.join(os.environ["RUNNER_TEMP"], "muguet-game.zip")
+
+          def request(url, timeout=90):
+              headers = {"User-Agent": "Muguet-iOS-IPA-GitHub-Actions"}
+              if token:
+                  headers["Authorization"] = "Bearer " + token
+              req = urllib.request.Request(url, headers=headers)
+              return urllib.request.urlopen(req, timeout=timeout)
+
+          def save_zip(url):
+              try:
+                  with request(url, timeout=180) as response, open(output, "wb") as out:
+                      out.write(response.read())
+                  with open(output, "rb") as f:
+                      return f.read(4) == b"PK\x03\x04" or f.read(2) == b"PK"
+              except Exception as exc:
+                  print("Download attempt failed:", type(exc).__name__, str(exc)[:240])
+                  return False
+
+          parsed = urllib.parse.urlparse(source)
+          match = re.fullmatch(r"/d/([A-Za-z0-9]+)/*", parsed.path) if parsed.hostname in ("gofile.io", "www.gofile.io") else None
+
+          if match:
+              code = match.group(1)
+              api_url = "https://api.gofile.io/contents/" + urllib.parse.quote(code, safe="")
+              try:
+                  with request(api_url) as response:
+                      payload = json.loads(response.read().decode("utf-8"))
+              except urllib.error.HTTPError as exc:
+                  sys.exit("GoFile API could not list this folder (HTTP %s). If GoFile requires Premium for folder listing/direct links on your account, use a direct ZIP URL from another host or provide a GoFile direct link." % exc.code)
+              except Exception as exc:
+                  sys.exit("Could not resolve the GoFile folder via its API: %s. You can still set MUGUET_GAME_ZIP_URL to a direct HTTPS ZIP URL." % str(exc)[:240])
+
+              if payload.get("status") != "ok":
+                  err = payload.get("status", "unknown error")
+                  detail = payload.get("data", {})
+                  sys.exit("GoFile refused folder listing (%s: %s). GoFile's API may require Premium for listing/direct links. Use a direct HTTPS ZIP URL if this account cannot list folders." % (err, str(detail)[:240]))
+
+              data = payload.get("data") or {}
+              children = data.get("childs") or {}
+              if isinstance(children, dict):
+                  entries = list(children.values())
+              elif isinstance(children, list):
+                  entries = children
+              else:
+                  entries = []
+
+              zips = [entry for entry in entries if str(entry.get("name", "")).lower().endswith(".zip") and entry.get("type") != "folder"]
+              if len(zips) != 1:
+                  names = [str(entry.get("name", "(unnamed)")) for entry in entries[:12]]
+                  sys.exit("GoFile folder must contain exactly one ZIP file at its top level; found %d. Top-level entries: %s" % (len(zips), ", ".join(names) or "(none)"))
+
+              entry = zips[0]
+              link = entry.get("link") or entry.get("downloadPage")
+              if not link:
+                  sys.exit("GoFile listed the ZIP but did not provide a download URL.")
+              # GoFile file page links commonly use /download/<id>/<filename>;
+              # the /download/direct/ form is the raw-download endpoint.
+              direct = re.sub(r"/download/", "/download/direct/", link, count=1)
+              if not save_zip(direct):
+                  if not save_zip(link):
+                      sys.exit("Found ZIP '%s' in GoFile, but neither its direct nor page URL returned ZIP bytes. GoFile may require a Premium direct link or an authenticated download." % entry.get("name", "game ZIP"))
+              print("Resolved GoFile folder and downloaded ZIP:", entry.get("name", "game ZIP"))
+          else:
+              if not save_zip(source):
+                  sys.exit("The URL did not return a ZIP file. For GoFile, provide a folder link like https://gofile.io/d/CODE; otherwise use a direct HTTPS ZIP URL.")
+
+          import zipfile
+          try:
+              with zipfile.ZipFile(output) as zf:
+                  bad = zf.testzip()
+                  if bad:
+                      sys.exit("ZIP integrity check failed at: " + bad)
+                  names = zf.namelist()
+          except Exception as exc:
+              sys.exit("Downloaded content is not a valid ZIP: " + str(exc)[:240])
+
+          if not any(re.search(r"(^|/)b/[^/]+/game\.wasm$", name) for name in names):
+              sys.exit("ZIP must contain b/<build>/game.wasm. The ZIP is valid but does not have the layout expected by make-ios.sh.")
+          print("Verified game ZIP layout. Game files will not be uploaded as workflow artifacts.")
+          PY
+
+      - name: Build IPA with private game code
+        if: ${{ inputs.include_game_code }}
+        env:
+          BUNDLE_ID: ${{ inputs.bundle_id }}
+        run: |
+          set -euo pipefail
+          ./make-ios.sh "$RUNNER_TEMP/muguet-game.zip" --ipa
+          rm -f "$RUNNER_TEMP/muguet-game.zip"
+
+      - name: Build IPA without game code
+        if: ${{ !inputs.include_game_code }}
+        env:
+          BUNDLE_ID: ${{ inputs.bundle_id }}
+        run: |
+          set -euo pipefail
+          echo "::warning::Building without game.wasm. This validates packaging only and is not a game-ready IPA."
+          ./make-ios.sh --ipa
+
+      - name: Verify IPA and report signing status
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s build/Muguet.ipa
+          unzip -tq build/Muguet.ipa
+          unzip -Z1 build/Muguet.ipa | grep -q '^Payload/Muguet.app/'
+          {
+            echo "## IPA build result"
+            echo
+            echo "- IPA: `build/Muguet.ipa`"
+            echo "- Size: $(du -h build/Muguet.ipa | awk '{print $1}')"
+            echo "- Game code included: ${{ inputs.include_game_code }}"
+            echo "- Signing: ad-hoc/unsigned sideload build; this is not App Store signed."
+            if [[ "${{ inputs.include_game_code }}" != "true" ]]; then
+              echo "- **Important:** this build has no precompiled game code and is only a packaging smoke test."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: muguet-ios-ipa
+          path: build/Muguet.ipa
+          if-no-files-found: error
+          retention-days: 7

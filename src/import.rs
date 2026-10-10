@@ -132,7 +132,7 @@ mod ffi {
     #[no_mangle]
     pub extern "C" fn muguet_import(zip: *const c_char, progress: extern "C" fn(u64, u64)) -> bool {
         let path = unsafe { CStr::from_ptr(zip) }.to_string_lossy().into_owned();
-        match super::import(std::path::Path::new(&path), &crate::config::game_dir(), false, |d, t| progress(d, t)) {
+        match super::import(std::path::Path::new(&path), &crate::config::game_dir(), !crate::code_embedded(), |d, t| progress(d, t)) {
             Ok(()) => true,
             Err(e) => {
                 *ERROR.lock().unwrap() = CString::new(format!("{e:#}")).ok();
