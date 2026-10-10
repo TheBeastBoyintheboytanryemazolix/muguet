@@ -58,6 +58,8 @@ jobs:
         run: |
           rustup toolchain install 1.98.1 --profile minimal
           rustup target add aarch64-apple-ios --toolchain 1.98.1
+          # make-ios.sh's first host build uses plain "cargo", so pin the default too.
+          rustup default 1.98.1
           rustup toolchain list
 
       - name: Cache Cargo build
