@@ -1,0 +1,52 @@
+name: Build IPA from main (isolated)
+
+on:
+  push:
+    branches:
+      - ci/build-ipa-from-main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build unsigned IPA from main without modifying main
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - name: Checkout main source only
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: source
+          persist-credentials: false
+
+      - name: Select Xcode
+        run: |
+          xcodebuild -version
+          xcode-select -p
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Install Rust toolchain and iOS target
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+          targets: aarch64-apple-ios
+
+      - name: Build IPA from unchanged main source
+        working-directory: source
+        env:
+          FREE: "1"
+          BUNDLE_ID: "ch.cclerc.muguet.ios"
+        run: ./make-ios.sh --ipa
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Muguet-IPA-from-main
+          path: source/build/Muguet.ipa
+          if-no-files-found: error
+          retention-days: 7
