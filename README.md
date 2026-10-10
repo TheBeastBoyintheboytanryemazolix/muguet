@@ -48,3 +48,19 @@ One player hosts from the launcher (or runs `muguet-server` on any machine), the
 
 
 Contributions are welcome !
+
+## Build an IPA from GitHub (no Mac/PC needed)
+
+The `.github/workflows/build-ipa.yml` workflow uses a GitHub-hosted Apple Silicon macOS runner with Xcode, Rust, and `xcodegen`. You can start it from GitHub's website on an iPad and download `muguet-ios-ipa` from the run's **Artifacts** section.
+
+1. Merge the workflow into the default branch so GitHub can offer it under **Actions**.
+2. Open **Settings → Secrets and variables → Actions** and add:
+   - `MUGUET_GAME_ZIP_URL`: an HTTPS download URL for your own authorized game ZIP. Keep the URL private if it contains a signed token.
+   - `MUGUET_GAME_ZIP_TOKEN` (optional): a bearer token if your file host requires one.
+3. Keep the game ZIP in private storage that you control. Do not commit it to this repository or upload it as a workflow artifact.
+4. On the **Actions** tab, select **Build iOS IPA → Run workflow**. Set **include_game_code** to true to precompile the private ZIP into the app; otherwise the workflow builds a packaging-only IPA without game code.
+5. When the run finishes, open it and download the `muguet-ios-ipa` artifact. It expires after seven days.
+
+The ZIP must contain `b/<build>/game.wasm`. The workflow validates the ZIP layout and then calls the repository's existing `make-ios.sh`; it does not replace Muguet's engine build steps.
+
+**Important:** GitHub Actions creates an unsigned/ad-hoc sideload IPA, not an App Store-signed app. Installing it on an iPad still requires a compatible sideloading method. The first build may fail if the upstream Rust toolchain, Wasmtime precompile flags, Xcode project, or iOS target no longer match; inspect the run logs before assuming the IPA is ready to play. The no-game-code mode is only a build/packaging smoke test.
