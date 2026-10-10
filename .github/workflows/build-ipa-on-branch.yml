@@ -5,6 +5,11 @@ on:
     branches:
       - github-actions-build-ipa
   workflow_dispatch:
+    inputs:
+      game_zip_url:
+        description: "Direct HTTPS URL to the game ZIP (not a GoFile folder page)"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -42,54 +47,34 @@ jobs:
           rustup default 1.98.1
           rustup toolchain list
 
-      - name: Download game ZIP from GoFile folder
+      - name: Download and validate game ZIP
+        env:
+          GAME_ZIP_URL: ${{ inputs.game_zip_url || secrets.MUGUET_GAME_ZIP_URL }}
         shell: bash
         run: |
           set -euo pipefail
+          if [[ -z "${GAME_ZIP_URL:-}" ]]; then
+            echo "::error::Provide a direct HTTPS ZIP URL using Run workflow > Game ZIP URL, or add secret MUGUET_GAME_ZIP_URL."
+            exit 1
+          fi
+          case "$GAME_ZIP_URL" in
+            https://*) ;;
+            *) echo "::error::Game ZIP URL must use HTTPS."; exit 1 ;;
+          esac
+          export GAME_ZIP_URL
           python3 <<'PY'
-          import json, os, re, sys, urllib.parse, urllib.request, zipfile
-
-          source = "https://gofile.io/d/CedTLH0Y"
+          import os, re, sys, urllib.request, zipfile
+          source = os.environ["GAME_ZIP_URL"].strip()
           output = os.path.join(os.environ["RUNNER_TEMP"], "muguet-game.zip")
-
-          def get(url, timeout=180):
-              req = urllib.request.Request(url, headers={"User-Agent": "Muguet-iOS-IPA-GitHub-Actions"})
-              with urllib.request.urlopen(req, timeout=timeout) as response:
-                  return response.read()
-
-          match = re.fullmatch(r"/d/([A-Za-z0-9]+)/*", urllib.parse.urlparse(source).path)
-          if not match:
-              sys.exit("Configured GoFile folder URL is invalid.")
-          api_url = "https://api.gofile.io/contents/" + match.group(1)
+          req = urllib.request.Request(source, headers={"User-Agent": "Muguet-iOS-IPA-GitHub-Actions"})
           try:
-              payload = json.loads(get(api_url, 90).decode("utf-8"))
+              with urllib.request.urlopen(req, timeout=240) as response:
+                  data = response.read()
+                  final_url = response.geturl()
           except Exception as exc:
-              sys.exit("Could not list GoFile folder: %s" % (str(exc)[:240],))
-          if payload.get("status") != "ok":
-              sys.exit("GoFile API did not return status=ok: %s" % payload.get("status"))
-          children = (payload.get("data") or {}).get("childs") or {}
-          entries = list(children.values()) if isinstance(children, dict) else (children if isinstance(children, list) else [])
-          zips = [entry for entry in entries if str(entry.get("name", "")).lower().endswith(".zip") and entry.get("type") != "folder"]
-          if len(zips) != 1:
-              sys.exit("Expected exactly one top-level ZIP in GoFile folder; found %d: %s" % (len(zips), ", ".join(str(e.get("name", "?")) for e in entries[:12])))
-          entry = zips[0]
-          link = entry.get("link") or entry.get("downloadPage")
-          if not link:
-              sys.exit("GoFile API listed a ZIP but provided no download URL.")
-          direct = re.sub(r"/download/", "/download/direct/", link, count=1)
-          data = None
-          errors = []
-          for url in (direct, link):
-              try:
-                  candidate = get(url)
-                  if candidate.startswith(b"PK"):
-                      data = candidate
-                      break
-                  errors.append("URL did not return ZIP bytes")
-              except Exception as exc:
-                  errors.append(str(exc)[:160])
-          if data is None:
-              sys.exit("GoFile ZIP download failed: " + "; ".join(errors))
+              sys.exit("Could not download the game ZIP: %s" % (str(exc)[:240],))
+          if not data.startswith(b"PK"):
+              sys.exit("The URL did not return ZIP bytes (it may be a GoFile folder webpage). Use a direct ZIP download URL, not https://gofile.io/d/CODE.")
           with open(output, "wb") as f:
               f.write(data)
           try:
@@ -99,10 +84,10 @@ jobs:
                   if bad:
                       sys.exit("ZIP integrity check failed at " + bad)
           except Exception as exc:
-              sys.exit("Downloaded file is not a valid ZIP: " + str(exc)[:200])
-          if not any(re.search(r"(^|/)b/[^/]+/game\.wasm$", name) for name in names):
+              sys.exit("Downloaded content is not a valid ZIP: " + str(exc)[:200])
+          if not any(re.search(r"(^|/)b/[^/]+/game\\.wasm$", name) for name in names):
               sys.exit("ZIP lacks required b/<build>/game.wasm layout.")
-          print("Downloaded and validated game ZIP:", entry.get("name", "game ZIP"))
+          print("Downloaded and validated game ZIP (%d bytes)." % len(data))
           PY
 
       - name: Build IPA
