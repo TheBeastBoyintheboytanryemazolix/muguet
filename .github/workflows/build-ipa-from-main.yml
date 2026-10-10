@@ -1,9 +1,6 @@
-name: Build IPA from main (isolated)
+name: Build IPA from main (private game file)
 
 on:
-  push:
-    branches:
-      - ci/build-ipa-from-main
   workflow_dispatch:
 
 permissions:
@@ -11,7 +8,7 @@ permissions:
 
 jobs:
   build:
-    name: Build unsigned IPA from main without modifying main
+    name: Build IPA from unchanged main and store privately in Google Drive
     runs-on: macos-26
     timeout-minutes: 90
     steps:
@@ -21,6 +18,31 @@ jobs:
           ref: main
           path: source
           persist-credentials: false
+
+      - name: Authenticate to private Google Drive
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+          token_format: access_token
+          scopes: https://www.googleapis.com/auth/drive
+
+      - name: Download private game.wasm
+        env:
+          ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
+          GAME_WASM_DRIVE_FILE_ID: ${{ secrets.GAME_WASM_DRIVE_FILE_ID }}
+        run: |
+          set -euo pipefail
+          test -n "$ACCESS_TOKEN"
+          test -n "$GAME_WASM_DRIVE_FILE_ID"
+          curl --fail --silent --show-error --location --retry 3 \
+            -H "Authorization: Bearer $ACCESS_TOKEN" \
+            "https://www.googleapis.com/drive/v3/files/$GAME_WASM_DRIVE_FILE_ID?alt=media" \
+            -o "$RUNNER_TEMP/game.wasm"
+          SIZE="$(stat -f%z "$RUNNER_TEMP/game.wasm")"
+          echo "Downloaded game.wasm ($SIZE bytes)"
+          test "$SIZE" -gt 50000000
+          test "$SIZE" -lt 100000000
 
       - name: Select Xcode
         run: |
@@ -36,17 +58,26 @@ jobs:
           toolchain: 1.98.1
           targets: aarch64-apple-ios
 
-      - name: Build IPA from unchanged main source
+      - name: Build IPA with private game code
         working-directory: source
         env:
           FREE: "1"
           BUNDLE_ID: "ch.cclerc.muguet.ios"
-        run: ./make-ios.sh --ipa
+        run: ./make-ios.sh "$RUNNER_TEMP/game.wasm" --ipa
 
-      - name: Upload IPA artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: Muguet-IPA-from-main
-          path: source/build/Muguet.ipa
-          if-no-files-found: error
-          retention-days: 7
+      - name: Upload IPA to private Google Drive folder
+        env:
+          ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
+          IPA_DRIVE_FOLDER_ID: ${{ secrets.IPA_DRIVE_FOLDER_ID }}
+        run: |
+          set -euo pipefail
+          test -n "$ACCESS_TOKEN"
+          test -n "$IPA_DRIVE_FOLDER_ID"
+          RESPONSE="$(curl --fail --silent --show-error --location \
+            -X POST \
+            -H "Authorization: Bearer $ACCESS_TOKEN" \
+            -F "metadata={\"name\":\"Muguet-IPA-from-main-${GITHUB_RUN_NUMBER}.ipa\",\"parents\":[\"$IPA_DRIVE_FOLDER_ID\"]};type=application/json" \
+            -F "file=@source/build/Muguet.ipa;type=application/octet-stream" \
+            "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink")"
+          echo "IPA uploaded to Google Drive. The file remains subject to the destination folder's sharing permissions."
+          echo "$RESPONSE"
