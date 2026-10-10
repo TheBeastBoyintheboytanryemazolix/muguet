@@ -90,7 +90,7 @@ jobs:
               parser = Links()
               parser.feed(html_text)
               # Some pages put download metadata in inline JSON rather than anchors.
-              for raw in re.findall(r'https?://[^\\"\'\\s<>]+|/(?:api/)?[^\\"\'\\s<>]*(?:download|file)[^\\"\'\\s<>]*', html, re.I):
+              for raw in re.findall(r'https?://[^\\"\'\\s<>]+|/(?:api/)?[^\\"\'\\s<>]*(?:download|file)[^\\"\'\\s<>]*', html_text, re.I):
                   found.append(urllib.parse.urljoin(page_url, html_unescape(raw)))
               return list(dict.fromkeys(found))
 
