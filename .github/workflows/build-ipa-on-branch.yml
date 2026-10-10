@@ -22,9 +22,8 @@ concurrency:
 jobs:
   build-ipa:
     name: Build unsigned iOS IPA with game code
-    # The ZIP is over 15 GB; the standard macos-26 runner's disk is too small.
-    # macos-26-xlarge has larger disk capacity, but may require eligible GitHub billing.
-    runs-on: macos-26-xlarge
+    # Download only b/<build>/game.wasm using HTTP byte ranges; never store the 15+ GB ZIP.
+    runs-on: macos-26
     timeout-minutes: 240
     steps:
       - name: Check out source
@@ -51,7 +50,7 @@ jobs:
           rustup default 1.98.1
           rustup toolchain list
 
-      - name: Download and validate game ZIP
+      - name: Resolve ZIP and range-extract only game.wasm
         env:
           GAME_ZIP_URL: ${{ inputs.game_zip_url || secrets.MUGUET_GAME_ZIP_URL || 'https://storage.to/oYIh7VyBn' }}
           GOFILE_TOKEN: ${{ secrets.GOFILE_TOKEN }}
@@ -60,150 +59,186 @@ jobs:
           set -euo pipefail
           export GAME_ZIP_URL GOFILE_TOKEN
           python3 <<'PY'
-          import html.parser, json, os, re, shutil, sys, urllib.parse, urllib.request, zipfile
+          import html
+          import html.parser
+          import json
+          import os
+          import re
+          import sys
+          import urllib.parse
+          import urllib.request
+          import zipfile
 
-          source = os.environ['GAME_ZIP_URL'].strip()
-          output = os.path.join(os.environ['RUNNER_TEMP'], 'muguet-game.zip')
+          source = os.environ["GAME_ZIP_URL"].strip()
+          output = os.path.join(os.environ["RUNNER_TEMP"], "game.wasm")
           headers = {
-              'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Safari/605.1.15',
-              'Accept': '*/*',
+              "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Safari/605.1.15",
+              "Accept": "*/*",
           }
 
-          def open_url(url, extra=None, timeout=240):
+          def request(url, extra=None, timeout=60):
               h = dict(headers)
               if extra:
                   h.update(extra)
               return urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=timeout)
 
-          def page_candidates(page_url, html_text):
+          def parse_links(page_url, text):
               found = []
-              class Links(html.parser.HTMLParser):
+              class Parser(html.parser.HTMLParser):
                   def handle_starttag(self, tag, attrs):
                       attrs = dict(attrs)
-                      for key in ('href', 'src', 'data-href', 'data-url', 'data-download-url'):
+                      for key in ("href", "src", "data-href", "data-url", "data-download-url"):
                           value = attrs.get(key)
                           if value:
-                              found.append(urllib.parse.urljoin(page_url, html_unescape(value)))
-              def html_unescape(s):
-                  import html
-                  return html.unescape(s).replace('&amp;', '&')
-              parser = Links()
-              parser.feed(html_text)
-              # Some pages put download metadata in inline JSON rather than anchors.
-              for raw in re.findall(r'https?://[^\\"\'\\s<>]+|/(?:api/)?[^\\"\'\\s<>]*(?:download|file)[^\\"\'\\s<>]*', html_text, re.I):
-                  found.append(urllib.parse.urljoin(page_url, html_unescape(raw)))
+                              found.append(urllib.parse.urljoin(page_url, html.unescape(value)))
+              p = Parser()
+              p.feed(text)
+              for raw in re.findall(r"""https?://[^"\'\s<>]+|/(?:api/)?[^"\'\s<>]*(?:download|file)[^"\'\s<>]*""", text, re.I):
+                  found.append(urllib.parse.urljoin(page_url, html.unescape(raw)))
               return list(dict.fromkeys(found))
 
-          def looks_like_zip(response, first):
-              ctype = (response.headers.get('Content-Type') or '').lower()
-              disp = (response.headers.get('Content-Disposition') or '').lower()
-              return first.startswith(b'PK') or ('zip' in ctype and 'text/html' not in ctype) or ('.zip' in disp)
-
-          # Resolve GoFile folder URLs using its API when available.
-          gofile = re.match(r'^https?://(?:www\\.)?gofile\\.io/d/([A-Za-z0-9]+)', source)
           candidates = []
+          gofile = re.match(r"^https?://(?:www\.)?gofile\.io/d/([A-Za-z0-9]+)", source)
+          storage = re.match(r"^https?://(?:www\.)?storage\.to/([A-Za-z0-9_-]+)(?:[/?#]|$)", source)
+
           if gofile:
               code = gofile.group(1)
-              token = os.environ.get('GOFILE_TOKEN', '').strip()
-              api_headers = {'Authorization': 'Bearer ' + token} if token else {}
+              token = os.environ.get("GOFILE_TOKEN", "").strip()
+              auth = {"Authorization": "Bearer " + token} if token else {}
               try:
-                  with open_url('https://api.gofile.io/contents/' + urllib.parse.quote(code), api_headers, 45) as r:
-                      obj = json.loads(r.read().decode('utf-8', 'replace'))
-                  children = (obj.get('data') or {}).get('children') or []
+                  with request("https://api.gofile.io/contents/" + urllib.parse.quote(code), auth) as r:
+                      obj = json.loads(r.read().decode("utf-8", "replace"))
+                  children = (obj.get("data") or {}).get("children") or {}
                   if isinstance(children, dict):
                       children = list(children.values())
                   for item in children if isinstance(children, list) else []:
-                      link = item.get('link') or item.get('downloadPage') or item.get('directLink')
-                      if item.get('name', '').lower().endswith('.zip') and link:
+                      link = item.get("link") or item.get("directLink") or item.get("downloadPage")
+                      if link and item.get("name", "").lower().endswith(".zip"):
                           candidates.append(link)
-              except Exception as exc:
-                  print('GoFile API listing unavailable:', str(exc)[:180])
+              except Exception as e:
+                  print("GoFile API listing unavailable:", str(e)[:180])
 
-          storage = re.match(r'^https?://(?:www\\.)?storage\\.to/([A-Za-z0-9_-]+)(?:[/?#]|$)', source)
           if storage:
-              file_id = storage.group(1)
-              # Try the share page first; Storage.to uses a download page, not a direct hotlink.
               try:
-                  with open_url(source, timeout=45) as r:
-                      page = r.read(8 * 1024 * 1024).decode('utf-8', 'replace')
+                  with request(source) as r:
                       page_url = r.geturl()
-                  candidates.extend(page_candidates(page_url, page))
-              except Exception as exc:
-                  print('Storage.to share page could not be parsed:', str(exc)[:180])
-              # Also probe common public download routes; only a response that looks like a ZIP is accepted.
+                      page = r.read(8 * 1024 * 1024).decode("utf-8", "replace")
+                  candidates.extend(parse_links(page_url, page))
+              except Exception as e:
+                  print("Storage.to page parse failed:", str(e)[:180])
+              fid = storage.group(1)
               candidates.extend([
-                  'https://storage.to/api/file/' + file_id + '/download',
-                  'https://storage.to/api/download/' + file_id,
-                  'https://storage.to/download/' + file_id,
+                  "https://storage.to/api/file/" + fid + "/download",
+                  "https://storage.to/api/download/" + fid,
+                  "https://storage.to/download/" + fid,
               ])
+          elif not gofile:
+              candidates.append(source)
 
-          if source.lower().endswith('.zip') or not storage and not gofile:
-              candidates.insert(0, source)
-
-          # Prefer URLs that explicitly look like downloads or ZIP files.
-          candidates = list(dict.fromkeys(candidates))
-          candidates.sort(key=lambda u: (0 if re.search(r'\\.zip(?:[?#]|$)|download', u, re.I) else 1))
+          # Keep HTTPS only and prefer URLs that look like file/download endpoints.
+          candidates = list(dict.fromkeys(u for u in candidates if u.startswith("https://")))
+          candidates.sort(key=lambda u: (0 if re.search(r"\.zip(?:[?#]|$)|download|direct", u, re.I) else 1))
           if not candidates:
-              sys.exit('Could not find a download URL in the share page. Check that the Storage.to link is public and has not expired.')
+              sys.exit("No candidate download URL found. Check that the share link is public and not expired.")
+
+          class RangeFile:
+              """Minimal seekable reader backed by HTTP Range requests; never downloads the full archive."""
+              def __init__(self, url):
+                  self.url = url
+                  with request(url, {"Range": "bytes=0-0"}) as r:
+                      data = r.read()
+                      cr = r.headers.get("Content-Range", "")
+                      if r.status != 206 or not cr.startswith("bytes 0-0/"):
+                          raise RuntimeError("server does not support HTTP byte-range requests")
+                      self.size = int(cr.rsplit("/", 1)[1])
+                      self.url = r.geturl()
+                      if len(data) != 1:
+                          raise RuntimeError("invalid byte-range response")
+                  self.pos = 0
+              def seekable(self):
+                  return True
+              def tell(self):
+                  return self.pos
+              def seek(self, offset, whence=0):
+                  if whence == 0:
+                      pos = offset
+                  elif whence == 1:
+                      pos = self.pos + offset
+                  elif whence == 2:
+                      pos = self.size + offset
+                  else:
+                      raise ValueError("invalid whence")
+                  if pos < 0:
+                      raise ValueError("negative seek")
+                  self.pos = pos
+                  return pos
+              def read(self, n=-1):
+                  if n is None or n < 0:
+                      n = self.size - self.pos
+                  n = min(n, self.size - self.pos)
+                  if n <= 0:
+                      return b""
+                  start, end = self.pos, self.pos + n - 1
+                  with request(self.url, {"Range": f"bytes={start}-{end}"}, timeout=120) as r:
+                      cr = r.headers.get("Content-Range", "")
+                      if r.status != 206 or not cr.startswith(f"bytes {start}-{end}/"):
+                          raise RuntimeError("range request was not honored; refusing to download the entire ZIP")
+                      data = r.read()
+                  if len(data) != n:
+                      raise RuntimeError(f"short range response ({len(data)} of {n} bytes)")
+                  self.pos += len(data)
+                  return data
+              def close(self):
+                  pass
 
           last_error = None
-          downloaded = False
+          extracted = False
           for candidate in candidates:
-              if not candidate.startswith('https://'):
-                  continue
               try:
-                  req = urllib.request.Request(candidate, headers=headers)
-                  response = urllib.request.urlopen(req, timeout=90)
-                  first = response.read(8)
-                  if not looks_like_zip(response, first):
-                      response.close()
-                      continue
-                  # The Range request may be ignored; save the bytes already read and stream the rest.
-                  free = shutil.disk_usage(os.environ['RUNNER_TEMP']).free
-                  if free < 35 * 1024**3:
-                      response.close()
-                      sys.exit('Not enough free disk space for the ZIP and iOS build. Need at least 35 GiB free; available %.1f GiB.' % (free / 1024**3))
-                  with open(output, 'wb') as f:
-                      f.write(first)
-                      while True:
-                          chunk = response.read(8 * 1024 * 1024)
-                          if not chunk:
-                              break
-                          f.write(chunk)
-                  response.close()
-                  downloaded = True
-                  print('Downloaded ZIP bytes from:', urllib.parse.urlsplit(response.geturl()).netloc)
+                  print("Trying range-capable ZIP source:", urllib.parse.urlsplit(candidate).netloc)
+                  remote = RangeFile(candidate)
+                  with zipfile.ZipFile(remote) as zf:
+                      entries = [n for n in zf.namelist() if re.search(r"(^|/)b/[^/]+/game\.wasm$", n)]
+                      if not entries:
+                          raise RuntimeError("ZIP does not contain b/<build>/game.wasm")
+                      entry = entries[0]
+                      info = zf.getinfo(entry)
+                      print(f"Found {entry}; compressed={info.compress_size} bytes, extracted={info.file_size} bytes")
+                      with zf.open(info, "r") as src, open(output, "wb") as dst:
+                          copied = 0
+                          while True:
+                              chunk = src.read(8 * 1024 * 1024)
+                              if not chunk:
+                                  break
+                              dst.write(chunk)
+                              copied += len(chunk)
+                      if copied != info.file_size:
+                          raise RuntimeError(f"extracted size mismatch ({copied} != {info.file_size})")
+                  extracted = True
+                  print(f"Extracted only game.wasm ({os.path.getsize(output)} bytes); the full ZIP was not downloaded.")
                   break
-              except Exception as exc:
-                  last_error = exc
+              except Exception as e:
+                  last_error = e
+                  print("Candidate failed:", str(e)[:240])
+                  try:
+                      if os.path.exists(output):
+                          os.remove(output)
+                  except OSError:
+                      pass
 
-          if not downloaded:
-              sys.exit('Could not resolve/download ZIP from the supplied URL. The Storage.to download button may require a browser-only flow, or the link may have expired. ' + (str(last_error)[:200] if last_error else 'No candidate returned ZIP bytes.'))
-
-          try:
-              with open(output, 'rb') as f:
-                  if f.read(2) != b'PK':
-                      sys.exit('Downloaded response is not a ZIP file.')
-              with zipfile.ZipFile(output) as zf:
-                  bad = zf.testzip()
-                  names = zf.namelist()
-                  if bad:
-                      sys.exit('ZIP integrity check failed at ' + bad)
-          except Exception as exc:
-              sys.exit('Downloaded content is not a valid ZIP: ' + str(exc)[:240])
-
-          if not any(re.search(r'(^|/)b/[^/]+/game\\.wasm$', name) for name in names):
-              sys.exit('ZIP lacks required b/<build>/game.wasm layout.')
-          print('Downloaded and validated game ZIP (%d bytes).' % os.path.getsize(output))
+          if not extracted:
+              sys.exit("Could not range-read the ZIP. The host may require a browser-only download or not support HTTP Range requests. No full-archive fallback is attempted because it would exceed runner storage. Last error: " + (str(last_error)[:240] if last_error else "no candidate succeeded"))
           PY
+          test -s "$RUNNER_TEMP/game.wasm"
+          df -h "$RUNNER_TEMP"
 
       - name: Build IPA
         env:
           BUNDLE_ID: ch.cclerc.muguet.ios
         run: |
           set -euo pipefail
-          ./make-ios.sh "$RUNNER_TEMP/muguet-game.zip" --ipa
-          rm -f "$RUNNER_TEMP/muguet-game.zip"
+          ./make-ios.sh "$RUNNER_TEMP/game.wasm" --ipa
+          rm -f "$RUNNER_TEMP/game.wasm"
 
       - name: Verify IPA
         run: |
