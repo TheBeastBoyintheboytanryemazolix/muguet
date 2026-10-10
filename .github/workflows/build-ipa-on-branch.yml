@@ -75,7 +75,7 @@ jobs:
                   h.update(extra)
               return urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=timeout)
 
-          def page_candidates(page_url, html):
+          def page_candidates(page_url, html_text):
               found = []
               class Links(html.parser.HTMLParser):
                   def handle_starttag(self, tag, attrs):
@@ -88,7 +88,7 @@ jobs:
                   import html
                   return html.unescape(s).replace('&amp;', '&')
               parser = Links()
-              parser.feed(html)
+              parser.feed(html_text)
               # Some pages put download metadata in inline JSON rather than anchors.
               for raw in re.findall(r'https?://[^\\"\'\\s<>]+|/(?:api/)?[^\\"\'\\s<>]*(?:download|file)[^\\"\'\\s<>]*', html, re.I):
                   found.append(urllib.parse.urljoin(page_url, html_unescape(raw)))
