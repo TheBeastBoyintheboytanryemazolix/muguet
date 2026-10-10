@@ -19,17 +19,31 @@ jobs:
           path: source
           persist-credentials: false
 
-      - name: Authenticate to private Google Drive
-        id: auth
-        uses: google-github-actions/auth@v2
-        with:
-          credentials_json: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
-          token_format: access_token
-          scopes: https://www.googleapis.com/auth/drive
+      - name: Get a private Google Drive access token
+        id: gdrive-auth
+        env:
+          GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
+          GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+          GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "$GDRIVE_CLIENT_ID"
+          test -n "$GDRIVE_CLIENT_SECRET"
+          test -n "$GDRIVE_REFRESH_TOKEN"
+          RESPONSE="$(curl --fail --silent --show-error --location \
+            -X POST "https://oauth2.googleapis.com/token" \
+            --data-urlencode "client_id=$GDRIVE_CLIENT_ID" \
+            --data-urlencode "client_secret=$GDRIVE_CLIENT_SECRET" \
+            --data-urlencode "refresh_token=$GDRIVE_REFRESH_TOKEN" \
+            --data-urlencode "grant_type=refresh_token")"
+          TOKEN="$(printf '%s' "$RESPONSE" | jq -r '.access_token // empty')"
+          test -n "$TOKEN"
+          echo "::add-mask::$TOKEN"
+          echo "access_token=$TOKEN" >> "$GITHUB_OUTPUT"
 
       - name: Download private game.wasm
         env:
-          ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
+          ACCESS_TOKEN: ${{ steps.gdrive-auth.outputs.access_token }}
           GAME_WASM_DRIVE_FILE_ID: ${{ secrets.GAME_WASM_DRIVE_FILE_ID }}
         run: |
           set -euo pipefail
@@ -67,7 +81,7 @@ jobs:
 
       - name: Upload IPA to private Google Drive folder
         env:
-          ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
+          ACCESS_TOKEN: ${{ steps.gdrive-auth.outputs.access_token }}
           IPA_DRIVE_FOLDER_ID: ${{ secrets.IPA_DRIVE_FOLDER_ID }}
         run: |
           set -euo pipefail
@@ -79,5 +93,5 @@ jobs:
             -F "metadata={\"name\":\"Muguet-IPA-from-main-${GITHUB_RUN_NUMBER}.ipa\",\"parents\":[\"$IPA_DRIVE_FOLDER_ID\"]};type=application/json" \
             -F "file=@source/build/Muguet.ipa;type=application/octet-stream" \
             "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink")"
-          echo "IPA uploaded to Google Drive. The file remains subject to the destination folder's sharing permissions."
+          echo "IPA uploaded to Google Drive. Keep the destination folder private."
           echo "$RESPONSE"
