@@ -152,7 +152,7 @@ jobs:
               if not candidate.startswith('https://'):
                   continue
               try:
-                  req = urllib.request.Request(candidate, headers={**headers, 'Range': 'bytes=0-7'})
+                  req = urllib.request.Request(candidate, headers=headers)
                   response = urllib.request.urlopen(req, timeout=90)
                   first = response.read(8)
                   if not looks_like_zip(response, first):
