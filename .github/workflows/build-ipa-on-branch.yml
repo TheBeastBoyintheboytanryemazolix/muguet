@@ -52,8 +52,10 @@ jobs:
 
       - name: Install browser automation for Storage.to download page
         run: |
-          python3 -m pip install --user playwright
-          python3 -m playwright install chromium
+          python3 -m venv "$RUNNER_TEMP/playwright-venv"
+          "$RUNNER_TEMP/playwright-venv/bin/python" -m pip install --upgrade pip
+          "$RUNNER_TEMP/playwright-venv/bin/python" -m pip install playwright
+          "$RUNNER_TEMP/playwright-venv/bin/python" -m playwright install chromium
 
       - name: Download ZIP and extract only game.wasm
         env:
@@ -63,7 +65,7 @@ jobs:
         run: |
           set -euo pipefail
           export GAME_ZIP_URL GOFILE_TOKEN
-          python3 <<'PY'
+          "$RUNNER_TEMP/playwright-venv/bin/python" <<'PY'
           import json, os, re, shutil, sys, urllib.parse, urllib.request, zipfile
           from playwright.sync_api import sync_playwright
 
