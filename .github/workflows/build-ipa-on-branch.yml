@@ -9,7 +9,7 @@ on:
       game_zip_url:
         description: "Direct ZIP URL, Storage.to share URL, or public GoFile folder URL"
         required: false
-        default: "https://storage.to/oYIh7VyBn"
+        default: ""
         type: string
 
 permissions:
