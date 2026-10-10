@@ -7,8 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       game_zip_url:
-        description: "Direct HTTPS URL to the game ZIP (not a GoFile folder page)"
-        required: true
+        description: "Direct ZIP URL or public GoFile folder URL"
+        required: false
+        default: "https://gofile.io/d/CedTLH0Y"
         type: string
 
 permissions:
