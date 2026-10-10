@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       game_zip_url:
-        description: "Direct ZIP URL or public GoFile folder URL"
+        description: "Direct ZIP URL, Storage.to share URL, or public GoFile folder URL"
         required: false
-        default: "https://gofile.io/d/CedTLH0Y"
+        default: "https://storage.to/oYIh7VyBn"
         type: string
 
 permissions:
@@ -22,17 +22,20 @@ concurrency:
 jobs:
   build-ipa:
     name: Build unsigned iOS IPA with game code
-    runs-on: macos-26
-    timeout-minutes: 180
+    # The ZIP is over 15 GB; the standard macos-26 runner's disk is too small.
+    # macos-26-xlarge has larger disk capacity, but may require eligible GitHub billing.
+    runs-on: macos-26-xlarge
+    timeout-minutes: 240
     steps:
       - name: Check out source
         uses: actions/checkout@v4
 
-      - name: Show Apple toolchain
+      - name: Show Apple toolchain and disk space
         run: |
           xcodebuild -version
           xcode-select -p
           swift --version
+          df -h "$RUNNER_TEMP"
 
       - name: Install xcodegen
         run: |
@@ -50,74 +53,150 @@ jobs:
 
       - name: Download and validate game ZIP
         env:
-          GAME_ZIP_URL: ${{ inputs.game_zip_url || secrets.MUGUET_GAME_ZIP_URL || 'https://gofile.io/d/CedTLH0Y' }}
+          GAME_ZIP_URL: ${{ inputs.game_zip_url || secrets.MUGUET_GAME_ZIP_URL || 'https://storage.to/oYIh7VyBn' }}
           GOFILE_TOKEN: ${{ secrets.GOFILE_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
           export GAME_ZIP_URL GOFILE_TOKEN
           python3 <<'PY'
-          import json, os, re, sys, urllib.parse, urllib.request, zipfile
+          import html.parser, json, os, re, shutil, sys, urllib.parse, urllib.request, zipfile
+
           source = os.environ['GAME_ZIP_URL'].strip()
           output = os.path.join(os.environ['RUNNER_TEMP'], 'muguet-game.zip')
-          headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Safari/605.1.15'}
-          def get(url, extra=None, timeout=240):
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Safari/605.1.15',
+              'Accept': '*/*',
+          }
+
+          def open_url(url, extra=None, timeout=240):
               h = dict(headers)
-              if extra: h.update(extra)
-              req = urllib.request.Request(url, headers=h)
-              with urllib.request.urlopen(req, timeout=timeout) as response:
-                  return response.read(), response.geturl()
-          match = re.match(r'^https?://(?:www\.)?gofile\.io/d/([A-Za-z0-9]+)', source)
-          if match:
-              code = match.group(1)
+              if extra:
+                  h.update(extra)
+              return urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=timeout)
+
+          def page_candidates(page_url, html):
+              found = []
+              class Links(html.parser.HTMLParser):
+                  def handle_starttag(self, tag, attrs):
+                      attrs = dict(attrs)
+                      for key in ('href', 'src', 'data-href', 'data-url', 'data-download-url'):
+                          value = attrs.get(key)
+                          if value:
+                              found.append(urllib.parse.urljoin(page_url, html_unescape(value)))
+              def html_unescape(s):
+                  import html
+                  return html.unescape(s).replace('&amp;', '&')
+              parser = Links()
+              parser.feed(html)
+              # Some pages put download metadata in inline JSON rather than anchors.
+              for raw in re.findall(r'https?://[^\\"\'\\s<>]+|/(?:api/)?[^\\"\'\\s<>]*(?:download|file)[^\\"\'\\s<>]*', html, re.I):
+                  found.append(urllib.parse.urljoin(page_url, html_unescape(raw)))
+              return list(dict.fromkeys(found))
+
+          def looks_like_zip(response, first):
+              ctype = (response.headers.get('Content-Type') or '').lower()
+              disp = (response.headers.get('Content-Disposition') or '').lower()
+              return first.startswith(b'PK') or ('zip' in ctype and 'text/html' not in ctype) or ('.zip' in disp)
+
+          # Resolve GoFile folder URLs using its API when available.
+          gofile = re.match(r'^https?://(?:www\\.)?gofile\\.io/d/([A-Za-z0-9]+)', source)
+          candidates = []
+          if gofile:
+              code = gofile.group(1)
               token = os.environ.get('GOFILE_TOKEN', '').strip()
               api_headers = {'Authorization': 'Bearer ' + token} if token else {}
-              resolved = None
               try:
-                  raw, _ = get('https://api.gofile.io/contents/' + urllib.parse.quote(code), api_headers, 45)
-                  obj = json.loads(raw.decode('utf-8', 'replace'))
-                  data_obj = obj.get('data') or {}
-                  children = data_obj.get('children') or data_obj.get('contents') or []
-                  if isinstance(children, dict): children = list(children.values())
+                  with open_url('https://api.gofile.io/contents/' + urllib.parse.quote(code), api_headers, 45) as r:
+                      obj = json.loads(r.read().decode('utf-8', 'replace'))
+                  children = (obj.get('data') or {}).get('children') or []
+                  if isinstance(children, dict):
+                      children = list(children.values())
                   for item in children if isinstance(children, list) else []:
-                      name = item.get('name', '')
                       link = item.get('link') or item.get('downloadPage') or item.get('directLink')
-                      if name.lower().endswith('.zip') and link:
-                          resolved = link
-                          break
-              except Exception:
-                  pass
-              if not resolved:
-                  try:
-                      page, _ = get(source, timeout=45)
-                      html = page.decode('utf-8', 'replace')
-                      urls = re.findall(r'https?://[^\"\'\s<>]+', html)
-                      resolved = next((u.replace('&amp;', '&') for u in urls if '.zip' in urllib.parse.unquote(u).lower()), None)
-                  except Exception:
-                      resolved = None
-              if not resolved:
-                  sys.exit('Could not automatically resolve this GoFile folder. GoFile may require an authenticated Premium listing API. Add a direct ZIP URL in Run workflow > Game ZIP URL, or set a GOFILE_TOKEN repository secret if your account has listing access.')
-              source = resolved
-          if not source.startswith('https://'):
-              sys.exit('Game ZIP URL must use HTTPS.')
+                      if item.get('name', '').lower().endswith('.zip') and link:
+                          candidates.append(link)
+              except Exception as exc:
+                  print('GoFile API listing unavailable:', str(exc)[:180])
+
+          storage = re.match(r'^https?://(?:www\\.)?storage\\.to/([A-Za-z0-9_-]+)(?:[/?#]|$)', source)
+          if storage:
+              file_id = storage.group(1)
+              # Try the share page first; Storage.to uses a download page, not a direct hotlink.
+              try:
+                  with open_url(source, timeout=45) as r:
+                      page = r.read(8 * 1024 * 1024).decode('utf-8', 'replace')
+                      page_url = r.geturl()
+                  candidates.extend(page_candidates(page_url, page))
+              except Exception as exc:
+                  print('Storage.to share page could not be parsed:', str(exc)[:180])
+              # Also probe common public download routes; only a response that looks like a ZIP is accepted.
+              candidates.extend([
+                  'https://storage.to/api/file/' + file_id + '/download',
+                  'https://storage.to/api/download/' + file_id,
+                  'https://storage.to/download/' + file_id,
+              ])
+
+          if source.lower().endswith('.zip') or not storage and not gofile:
+              candidates.insert(0, source)
+
+          # Prefer URLs that explicitly look like downloads or ZIP files.
+          candidates = list(dict.fromkeys(candidates))
+          candidates.sort(key=lambda u: (0 if re.search(r'\\.zip(?:[?#]|$)|download', u, re.I) else 1))
+          if not candidates:
+              sys.exit('Could not find a download URL in the share page. Check that the Storage.to link is public and has not expired.')
+
+          last_error = None
+          downloaded = False
+          for candidate in candidates:
+              if not candidate.startswith('https://'):
+                  continue
+              try:
+                  req = urllib.request.Request(candidate, headers={**headers, 'Range': 'bytes=0-7'})
+                  response = urllib.request.urlopen(req, timeout=90)
+                  first = response.read(8)
+                  if not looks_like_zip(response, first):
+                      response.close()
+                      continue
+                  # The Range request may be ignored; save the bytes already read and stream the rest.
+                  free = shutil.disk_usage(os.environ['RUNNER_TEMP']).free
+                  if free < 35 * 1024**3:
+                      response.close()
+                      sys.exit('Not enough free disk space for the ZIP and iOS build. Need at least 35 GiB free; available %.1f GiB.' % (free / 1024**3))
+                  with open(output, 'wb') as f:
+                      f.write(first)
+                      while True:
+                          chunk = response.read(8 * 1024 * 1024)
+                          if not chunk:
+                              break
+                          f.write(chunk)
+                  response.close()
+                  downloaded = True
+                  print('Downloaded ZIP bytes from:', urllib.parse.urlsplit(response.geturl()).netloc)
+                  break
+              except Exception as exc:
+                  last_error = exc
+
+          if not downloaded:
+              sys.exit('Could not resolve/download ZIP from the supplied URL. The Storage.to download button may require a browser-only flow, or the link may have expired. ' + (str(last_error)[:200] if last_error else 'No candidate returned ZIP bytes.'))
+
           try:
-              data, final_url = get(source)
-          except Exception as exc:
-              sys.exit('Could not download the game ZIP: ' + str(exc)[:240])
-          if not data.startswith(b'PK'):
-              sys.exit('The resolved URL did not return ZIP bytes; the link may require a browser session or may have expired.')
-          with open(output, 'wb') as f: f.write(data)
-          try:
+              with open(output, 'rb') as f:
+                  if f.read(2) != b'PK':
+                      sys.exit('Downloaded response is not a ZIP file.')
               with zipfile.ZipFile(output) as zf:
                   bad = zf.testzip()
                   names = zf.namelist()
-                  if bad: sys.exit('ZIP integrity check failed at ' + bad)
+                  if bad:
+                      sys.exit('ZIP integrity check failed at ' + bad)
           except Exception as exc:
-              sys.exit('Downloaded content is not a valid ZIP: ' + str(exc)[:200])
-          if not any(re.search(r'(^|/)b/[^/]+/game\.wasm$', name) for name in names):
+              sys.exit('Downloaded content is not a valid ZIP: ' + str(exc)[:240])
+
+          if not any(re.search(r'(^|/)b/[^/]+/game\\.wasm$', name) for name in names):
               sys.exit('ZIP lacks required b/<build>/game.wasm layout.')
-          print('Downloaded and validated game ZIP (%d bytes).' % len(data))
+          print('Downloaded and validated game ZIP (%d bytes).' % os.path.getsize(output))
           PY
+
       - name: Build IPA
         env:
           BUNDLE_ID: ch.cclerc.muguet.ios
