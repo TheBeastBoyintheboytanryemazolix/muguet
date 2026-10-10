@@ -1,0 +1,130 @@
+name: Build Muguet IPA (branch trigger)
+
+on:
+  push:
+    branches:
+      - github-actions-build-ipa
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: muguet-ipa-branch-build
+  cancel-in-progress: true
+
+jobs:
+  build-ipa:
+    name: Build unsigned iOS IPA with game code
+    runs-on: macos-26
+    timeout-minutes: 180
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Show Apple toolchain
+        run: |
+          xcodebuild -version
+          xcode-select -p
+          swift --version
+
+      - name: Install xcodegen
+        run: |
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+          xcodegen --version
+
+      - name: Install required Rust toolchain and iOS target
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup target add aarch64-apple-ios --toolchain 1.98.1
+          rustup default 1.98.1
+          rustup toolchain list
+
+      - name: Download game ZIP from GoFile folder
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import json, os, re, sys, urllib.parse, urllib.request, zipfile
+
+          source = "https://gofile.io/d/CedTLH0Y"
+          output = os.path.join(os.environ["RUNNER_TEMP"], "muguet-game.zip")
+
+          def get(url, timeout=180):
+              req = urllib.request.Request(url, headers={"User-Agent": "Muguet-iOS-IPA-GitHub-Actions"})
+              with urllib.request.urlopen(req, timeout=timeout) as response:
+                  return response.read()
+
+          match = re.fullmatch(r"/d/([A-Za-z0-9]+)/*", urllib.parse.urlparse(source).path)
+          if not match:
+              sys.exit("Configured GoFile folder URL is invalid.")
+          api_url = "https://api.gofile.io/contents/" + match.group(1)
+          try:
+              payload = json.loads(get(api_url, 90).decode("utf-8"))
+          except Exception as exc:
+              sys.exit("Could not list GoFile folder: %s" % (str(exc)[:240],))
+          if payload.get("status") != "ok":
+              sys.exit("GoFile API did not return status=ok: %s" % payload.get("status"))
+          children = (payload.get("data") or {}).get("childs") or {}
+          entries = list(children.values()) if isinstance(children, dict) else (children if isinstance(children, list) else [])
+          zips = [entry for entry in entries if str(entry.get("name", "")).lower().endswith(".zip") and entry.get("type") != "folder"]
+          if len(zips) != 1:
+              sys.exit("Expected exactly one top-level ZIP in GoFile folder; found %d: %s" % (len(zips), ", ".join(str(e.get("name", "?")) for e in entries[:12])))
+          entry = zips[0]
+          link = entry.get("link") or entry.get("downloadPage")
+          if not link:
+              sys.exit("GoFile API listed a ZIP but provided no download URL.")
+          direct = re.sub(r"/download/", "/download/direct/", link, count=1)
+          data = None
+          errors = []
+          for url in (direct, link):
+              try:
+                  candidate = get(url)
+                  if candidate.startswith(b"PK"):
+                      data = candidate
+                      break
+                  errors.append("URL did not return ZIP bytes")
+              except Exception as exc:
+                  errors.append(str(exc)[:160])
+          if data is None:
+              sys.exit("GoFile ZIP download failed: " + "; ".join(errors))
+          with open(output, "wb") as f:
+              f.write(data)
+          try:
+              with zipfile.ZipFile(output) as zf:
+                  bad = zf.testzip()
+                  names = zf.namelist()
+                  if bad:
+                      sys.exit("ZIP integrity check failed at " + bad)
+          except Exception as exc:
+              sys.exit("Downloaded file is not a valid ZIP: " + str(exc)[:200])
+          if not any(re.search(r"(^|/)b/[^/]+/game\.wasm$", name) for name in names):
+              sys.exit("ZIP lacks required b/<build>/game.wasm layout.")
+          print("Downloaded and validated game ZIP:", entry.get("name", "game ZIP"))
+          PY
+
+      - name: Build IPA
+        env:
+          BUNDLE_ID: ch.cclerc.muguet.ios
+        run: |
+          set -euo pipefail
+          ./make-ios.sh "$RUNNER_TEMP/muguet-game.zip" --ipa
+          rm -f "$RUNNER_TEMP/muguet-game.zip"
+
+      - name: Verify IPA
+        run: |
+          set -euo pipefail
+          test -s build/Muguet.ipa
+          unzip -tq build/Muguet.ipa
+          unzip -Z1 build/Muguet.ipa | grep -q '^Payload/Muguet.app/'
+          echo "IPA built successfully. This is an ad-hoc/unsigned sideload build, not App Store signed." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: muguet-ios-ipa
+          path: build/Muguet.ipa
+          if-no-files-found: error
+          retention-days: 7
