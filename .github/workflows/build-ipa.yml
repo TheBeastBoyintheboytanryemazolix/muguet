@@ -1,0 +1,143 @@
+name: Build iOS IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      include_game_code:
+        description: "Precompile your privately hosted game.wasm ZIP into the IPA (requires repository secrets)"
+        required: true
+        type: boolean
+        default: false
+      bundle_id:
+        description: "Bundle identifier for sideloading (use a unique reverse-DNS identifier)"
+        required: true
+        type: string
+        default: "ch.cclerc.muguet.ios"
+  push:
+    branches:
+      - main
+    paths:
+      - "src/**"
+      - "ios/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "build.rs"
+      - "make-ios.sh"
+      - ".github/workflows/build-ipa.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-ipa:
+    name: Build unsigned iOS IPA
+    runs-on: macos-26
+    timeout-minutes: 180
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Show Apple toolchain
+        run: |
+          xcodebuild -version
+          xcode-select -p
+          swift --version
+
+      - name: Install xcodegen
+        run: |
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+          xcodegen --version
+
+      - name: Install required Rust toolchain and iOS target
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup target add aarch64-apple-ios --toolchain 1.98.1
+          rustup toolchain list
+
+      - name: Cache Cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Download private game ZIP
+        if: ${{ inputs.include_game_code }}
+        env:
+          GAME_ZIP_URL: ${{ secrets.MUGUET_GAME_ZIP_URL }}
+          GAME_ZIP_TOKEN: ${{ secrets.MUGUET_GAME_ZIP_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${GAME_ZIP_URL:-}" ]]; then
+            echo "::error::include_game_code was selected, but the MUGUET_GAME_ZIP_URL repository secret is empty."
+            echo "Store an HTTPS download URL for your own authorized game ZIP in Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+          case "$GAME_ZIP_URL" in
+            https://*) ;;
+            *) echo "::error::MUGUET_GAME_ZIP_URL must use HTTPS."; exit 1 ;;
+          esac
+          args=(--fail --show-error --silent --location --retry 3 --retry-delay 2)
+          if [[ -n "${GAME_ZIP_TOKEN:-}" ]]; then
+            args+=(--header "Authorization: Bearer $GAME_ZIP_TOKEN")
+          fi
+          curl "${args[@]}" "$GAME_ZIP_URL" --output "$RUNNER_TEMP/muguet-game.zip"
+          if ! unzip -tq "$RUNNER_TEMP/muguet-game.zip" >/dev/null; then
+            echo "::error::The downloaded file is not a valid ZIP. Check the URL and access token."
+            exit 1
+          fi
+          if ! unzip -Z1 "$RUNNER_TEMP/muguet-game.zip" | grep -Eq '(^|/)b/[^/]+/game\.wasm$'; then
+            echo "::error::ZIP must contain b/<build>/game.wasm."
+            exit 1
+          fi
+          echo "Verified game ZIP layout. Game files will not be uploaded as workflow artifacts."
+
+      - name: Build IPA with private game code
+        if: ${{ inputs.include_game_code }}
+        env:
+          BUNDLE_ID: ${{ inputs.bundle_id }}
+        run: |
+          set -euo pipefail
+          ./make-ios.sh "$RUNNER_TEMP/muguet-game.zip" --ipa
+          rm -f "$RUNNER_TEMP/muguet-game.zip"
+
+      - name: Build IPA without game code
+        if: ${{ !inputs.include_game_code }}
+        env:
+          BUNDLE_ID: ${{ inputs.bundle_id }}
+        run: |
+          set -euo pipefail
+          echo "::warning::Building without game.wasm. This validates packaging only and is not a game-ready IPA."
+          ./make-ios.sh --ipa
+
+      - name: Verify IPA and report signing status
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s build/Muguet.ipa
+          unzip -tq build/Muguet.ipa
+          unzip -Z1 build/Muguet.ipa | grep -q '^Payload/Muguet.app/'
+          {
+            echo "## IPA build result"
+            echo
+            echo "- IPA: `build/Muguet.ipa`"
+            echo "- Size: $(du -h build/Muguet.ipa | awk '{print $1}')"
+            echo "- Game code included: ${{ inputs.include_game_code }}"
+            echo "- Signing: ad-hoc/unsigned sideload build; this is not App Store signed."
+            if [[ "${{ inputs.include_game_code }}" != "true" ]]; then
+              echo "- **Important:** this build has no precompiled game code and is only a packaging smoke test."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: muguet-ios-ipa
+          path: build/Muguet.ipa
+          if-no-files-found: error
+          retention-days: 7
